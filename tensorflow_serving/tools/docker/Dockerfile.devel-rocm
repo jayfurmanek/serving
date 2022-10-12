@@ -41,8 +41,7 @@ RUN bin/bash -c 'if [[ $ROCM_DEB_REPO == https://repo.radeon.com/rocm/*  ]] ; th
       echo "deb [arch=amd64 trusted=yes] $ROCM_DEB_REPO $ROCM_BUILD_NAME $ROCM_BUILD_NUM" > /etc/apt/sources.list.d/rocm.list ; \
     fi'
 
-RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub && \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
         automake \
         build-essential \
         ca-certificates \
@@ -80,8 +79,6 @@ RUN MIOPENKERNELS=$( \
     rocm-dev rocm-libs rccl ${MIOPENKERNELS} && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-# Set up paths
 
 # Add target file to help determine which device(s) to build for
 RUN printf '%s\n' > ${ROCM_PATH}/bin/target.lst ${GPU_DEVICE_TARGETS}
