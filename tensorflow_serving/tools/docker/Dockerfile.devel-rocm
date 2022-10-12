@@ -11,27 +11,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#FROM ubuntu:18.04 as base_build
 FROM ubuntu:focal as base_build
 
 ARG TF_SERVING_VERSION_GIT_BRANCH=master
 ARG TF_SERVING_VERSION_GIT_COMMIT=HEAD
-ARG DEBIAN_FRONTEND=noninteractive
 
-LABEL maintainer=gvasudevan@google.com
+LABEL maintainer=Jason.Furmanek@amd.com
 LABEL tensorflow_serving_github_branchtag=${TF_SERVING_VERSION_GIT_BRANCH}
 LABEL tensorflow_serving_github_commit=${TF_SERVING_VERSION_GIT_COMMIT}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG ROCM_DEB_REPO=https://repo.radeon.com/rocm/apt/5.3/
+ARG ROCM_BUILD_NAME=ubuntu
+ARG ROCM_BUILD_NUM=main
+ARG ROCM_PATH=/opt/rocm-5.3.0
+ARG GPU_DEVICE_TARGETS="gfx900 gfx906 gfx908 gfx90a gfx1030"
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TF_NEED_ROCM 1
+ENV HOME /root/
+ENV HIP_PLATFORM=amd
+RUN apt-get --allow-unauthenticated update && apt install -y wget software-properties-common
+
+# Add rocm repository
+RUN apt-get clean all
+RUN wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | apt-key add -;
+RUN bin/bash -c 'if [[ $ROCM_DEB_REPO == https://repo.radeon.com/rocm/*  ]] ; then \
+      echo "deb [arch=amd64] $ROCM_DEB_REPO $ROCM_BUILD_NAME $ROCM_BUILD_NUM" > /etc/apt/sources.list.d/rocm.list; \
+    else \
+      echo "deb [arch=amd64 trusted=yes] $ROCM_DEB_REPO $ROCM_BUILD_NAME $ROCM_BUILD_NUM" > /etc/apt/sources.list.d/rocm.list ; \
+    fi'
+
+RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub && \
+    apt-get update && apt-get install -y --no-install-recommends \
         automake \
         build-essential \
         ca-certificates \
         curl \
         git \
-        libcurl3-dev \
         libfreetype6-dev \
-        libpng-dev \
         libtool \
+        libcurl3-dev \
         libzmq3-dev \
         mlocate \
         openjdk-8-jdk\
@@ -45,9 +64,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
         zlib1g-dev \
         python3-distutils \
-        && \
+        python-distutils-extra
+
+# Install rocm pkgs
+# For precompiled miopen kernels search for all unversioned packages
+# if search fails it will abort so use true to avoid case where search fails
+RUN MIOPENKERNELS=$( \
+                    apt-cache search --names-only miopenkernels | \
+                    awk '{print $1}' | \
+                    grep -F -v . || \
+                    true \
+    ) && \
+    apt-get update --allow-insecure-repositories && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
+    rocm-dev rocm-libs rccl ${MIOPENKERNELS} && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Set up paths
+
+# Add target file to help determine which device(s) to build for
+RUN printf '%s\n' > ${ROCM_PATH}/bin/target.lst ${GPU_DEVICE_TARGETS}
+RUN touch ${ROCM_PATH}/.info/version
 
 # Install python 3.7.
 RUN add-apt-repository ppa:deadsnakes/ppa && \
@@ -74,8 +112,7 @@ RUN pip3 --no-cache-dir install \
     numpy \
     portpicker \
     requests \
-    --ignore-installed setuptools \
-    --ignore-installed six>=1.12.0
+     --ignore-installed six>=1.12.0
 
 # Set up Bazel
 ENV BAZEL_VERSION 5.1.1
@@ -89,6 +126,20 @@ RUN mkdir /bazel && \
     cd / && \
     rm -f /bazel/bazel-$BAZEL_VERSION-installer-linux-x86_64.sh
 
+# Build TensorFlow with the ROCm configuration
+ENV CI_BUILD_PYTHON python
+
+ENV HCC_HOME=$ROCM_PATH/hcc
+ENV HIP_PATH=$ROCM_PATH/hip
+ENV OPENCL_ROOT=$ROCM_PATH/opencl
+ENV PATH="$HCC_HOME/bin:$HIP_PATH/bin:${PATH}"
+ENV PATH="$ROCM_PATH/bin:${PATH}"
+ENV PATH="$OPENCL_ROOT/bin:${PATH}"
+
+
+# Set TMP for nvidia build environment
+ENV TMP="/tmp"
+
 # Download TF Serving sources (optionally at specific commit).
 WORKDIR /tensorflow-serving
 RUN curl -sSL --retry 5 https://github.com/tensorflow/serving/tarball/${TF_SERVING_VERSION_GIT_COMMIT} | tar --strip-components=1 -xzf -
@@ -100,10 +151,22 @@ RUN echo "Building with build options: ${TF_SERVING_BUILD_OPTIONS}"
 ARG TF_SERVING_BAZEL_OPTIONS=""
 RUN echo "Building with Bazel options: ${TF_SERVING_BAZEL_OPTIONS}"
 
-RUN bazel build --color=yes --curses=yes \
+# Download tensorflow-rocm for org_tensorflow override
+ENV ROCM_TF_FORK_REPO="https://github.com/ROCmSoftwarePlatform/tensorflow-upstream"
+ENV ROCM_TF_FORK_BRANCH="develop-upstream"
+RUN rm -rf /tmp/tensorflow-upstream || true && \
+    git clone -b ${ROCM_TF_FORK_BRANCH} ${ROCM_TF_FORK_REPO} /tmp/tensorflow-upstream
+
+RUN bazel build --color=yes --curses=yes --copt="-fPIC"\
+    --override_repository=org_tensorflow=/tmp/tensorflow-upstream \
+    --crosstool_top=@local_config_rocm//crosstool:toolchain \
+    --define=using_rocm_hipcc=true \
+    --define=tensorflow_mkldnn_contraction_kernel=0 \
+    --repo_env TF_NEED_ROCM=1 \
     ${TF_SERVING_BAZEL_OPTIONS} \
     --verbose_failures \
     --output_filter=DONT_MATCH_ANYTHING \
+    --action_env ROCM_PATH=/opt/rocm-5.3.0 \
     ${TF_SERVING_BUILD_OPTIONS} \
     tensorflow_serving/model_servers:tensorflow_model_server && \
     cp bazel-bin/tensorflow_serving/model_servers/tensorflow_model_server \
@@ -111,15 +174,21 @@ RUN bazel build --color=yes --curses=yes \
 
 # Build and install TensorFlow Serving API
 RUN bazel build --color=yes --curses=yes \
+    --override_repository=org_tensorflow=/tmp/tensorflow-upstream \
+    --crosstool_top=@local_config_rocm//crosstool:toolchain \
+    --define=using_rocm_hipcc=true \
+    --define=tensorflow_mkldnn_contraction_kernel=0 \
+    --repo_env TF_NEED_ROCM=1 \
     ${TF_SERVING_BAZEL_OPTIONS} \
     --verbose_failures \
     --output_filter=DONT_MATCH_ANYTHING \
+    --action_env ROCM_PATH=/opt/rocm-5.3.0 \
     ${TF_SERVING_BUILD_OPTIONS} \
     tensorflow_serving/tools/pip_package:build_pip_package && \
     bazel-bin/tensorflow_serving/tools/pip_package/build_pip_package \
     /tmp/pip && \
     pip --no-cache-dir install --upgrade \
-    /tmp/pip/tensorflow_serving_api-*.whl && \
+    /tmp/pip/tensorflow_serving_api_gpu-*.whl && \
     rm -rf /tmp/pip
 
 FROM binary_build as clean_build
@@ -127,3 +196,4 @@ FROM binary_build as clean_build
 RUN bazel clean --expunge --color=yes && \
     rm -rf /root/.cache
 CMD ["/bin/bash"]
+
